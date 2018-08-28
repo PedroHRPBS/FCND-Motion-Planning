@@ -5,16 +5,19 @@ from enum import Enum, auto
 
 import numpy as np
 
-from planning_utils import a_star, heuristic, create_grid
+from planning_utils import a_star, heuristic, create_grid, prune_path_bres, find_start_goal, breadth_first, a_star_bfs, create_grid_bfs
 from udacidrone import Drone
 from udacidrone.connection import MavlinkConnection
 from udacidrone.messaging import MsgID
 from udacidrone.frame_utils import global_to_local
 
+from skimage.morphology import medial_axis
+from skimage.util import invert
+from math import pi
 
 class States(Enum):
     MANUAL = auto()
-    ARMING = auto()
+    ARMING =    auto()
     TAKEOFF = auto()
     WAYPOINT = auto()
     LANDING = auto()
@@ -41,11 +44,13 @@ class MotionPlanning(Drone):
         self.register_callback(MsgID.STATE, self.state_callback)
 
     def local_position_callback(self):
+        #print('global home {0}, global position {1}, local position {2}'.format(self.global_home, self.global_position,
+                                                                         #self.local_position))
         if self.flight_state == States.TAKEOFF:
             if -1.0 * self.local_position[2] > 0.95 * self.target_position[2]:
                 self.waypoint_transition()
         elif self.flight_state == States.WAYPOINT:
-            if np.linalg.norm(self.target_position[0:2] - self.local_position[0:2]) < 1.0:
+            if np.linalg.norm(self.target_position[0:2] - self.local_position[0:2]) < 5:
                 if len(self.waypoints) > 0:
                     self.waypoint_transition()
                 else:
@@ -111,51 +116,90 @@ class MotionPlanning(Drone):
         data = msgpack.dumps(self.waypoints)
         self.connection._master.write(data)
 
+    def proj_min_req(self, data, global_goal, TARGET_ALTITUDE, SAFETY_DISTANCE):
+        grid, north_offset, east_offset = create_grid(data, TARGET_ALTITUDE, SAFETY_DISTANCE)
+        print("North offset = {0}, east offset = {1}".format(north_offset, east_offset))
+        grid_start = (int(self.local_position[0]) - north_offset, int(self.local_position[1]) - east_offset) 
+        local_goal = global_to_local(global_goal, self.global_home)
+        grid_goal = (int(local_goal[0]) - north_offset, int(local_goal[1]) - east_offset)
+        print('Local Start and Goal: ', grid_start, grid_goal)
+        path, _ = a_star(grid, heuristic, grid_start, grid_goal)
+        pruned_path = prune_path_bres(path, grid)
+        waypoints = [[p[0] + north_offset, p[1] + east_offset, TARGET_ALTITUDE, 0] for p in pruned_path]
+        for i in range(1, len(waypoints)):
+            heading = np.arctan2(waypoints[i][0] - waypoints[i-1][0], waypoints[i][1] - waypoints[i-1][1]) - pi/2
+            waypoints[i][3] =  -heading
+        return waypoints
+
+    def medial_axis_Astar(self, data, global_goal, TARGET_ALTITUDE, SAFETY_DISTANCE):
+        grid, north_offset, east_offset = create_grid_bfs(data, TARGET_ALTITUDE, SAFETY_DISTANCE)
+        skeleton = medial_axis(invert(grid))
+        print("North offset = {0}, east offset = {1}".format(north_offset, east_offset))
+        grid_start = (int(self.local_position[0]) - north_offset, int(self.local_position[1]) - east_offset) 
+        local_goal = global_to_local(global_goal, self.global_home)
+        grid_goal = (int(local_goal[0]) - north_offset, int(local_goal[1]) - east_offset)
+        skel_start, skel_goal = find_start_goal(skeleton, grid_start, grid_goal)
+        mapa = breadth_first(invert(skeleton).astype(np.int), tuple(skel_goal), tuple(skel_start))
+        print('Local Start and Goal: ', grid_start, grid_goal)
+        path, _ = a_star_bfs(invert(skeleton).astype(np.int), mapa, tuple(skel_start), tuple(skel_goal))
+        path.append(grid_goal)
+        pruned_path = prune_path_bres(path, grid)
+        waypoints = [[int(p[0] + north_offset), int(p[1] + east_offset), TARGET_ALTITUDE, 0] for p in pruned_path]
+        for i in range(1, len(waypoints)):
+            heading = np.arctan2(waypoints[i][0] - waypoints[i-1][0], waypoints[i][1] - waypoints[i-1][1]) - pi/2
+            waypoints[i][3] =  -heading
+        return waypoints
+
     def plan_path(self):
         self.flight_state = States.PLANNING
         print("Searching for a path ...")
-        TARGET_ALTITUDE = 5
+        TARGET_ALTITUDE = 25
         SAFETY_DISTANCE = 5
-
         self.target_position[2] = TARGET_ALTITUDE
+        filename = 'colliders.csv'
+        firstline = open(filename).readline().replace(',','')
 
-        # TODO: read lat0, lon0 from colliders into floating point values
-        
-        # TODO: set home position to (lon0, lat0, 0)
+        l = []
+        for t in firstline.split():
+            try:
+                l.append(float(t))
+            except ValueError:
+                pass
+        lat0, lon0 = l
 
-        # TODO: retrieve current global position
- 
-        # TODO: convert to current local position using global_to_local()
-        
-        print('global home {0}, position {1}, local position {2}'.format(self.global_home, self.global_position,
+        self.set_home_position(lon0, lat0, 0)
+        print('global home {0}, global position {1}, local position {2}'.format(self.global_home, self.global_position,
                                                                          self.local_position))
-        # Read in obstacle map
-        data = np.loadtxt('colliders.csv', delimiter=',', dtype='Float64', skiprows=2)
-        
-        # Define a grid for a particular altitude and safety margin around obstacles
-        grid, north_offset, east_offset = create_grid(data, TARGET_ALTITUDE, SAFETY_DISTANCE)
-        print("North offset = {0}, east offset = {1}".format(north_offset, east_offset))
-        # Define starting point on the grid (this is just grid center)
-        grid_start = (-north_offset, -east_offset)
-        # TODO: convert start position to current position rather than map center
-        
-        # Set goal as some arbitrary position on the grid
-        grid_goal = (-north_offset + 10, -east_offset + 10)
-        # TODO: adapt to set goal as latitude / longitude position and convert
+        data = np.loadtxt(filename, delimiter=',', dtype='Float64', skiprows=2)
 
-        # Run A* to find a path from start to goal
-        # TODO: add diagonal motions with a cost of sqrt(2) to your A* implementation
-        # or move to a different search space such as a graph (not done here)
-        print('Local Start and Goal: ', grid_start, grid_goal)
-        path, _ = a_star(grid, heuristic, grid_start, grid_goal)
-        # TODO: prune path to minimize number of waypoints
-        # TODO (if you're feeling ambitious): Try a different approach altogether!
+        while True:      
+            try:
+                user_input = input("\nEnter longitude and latitude separated by commas:\nExamples:"
+                            "-122.395075, 37.797183\n         -122.401044, 37.795678\n         -122.393173, 37.792542\n: ")
+                input_list = user_input.split(',')
+                global_goal = [float(x.strip()) for x in input_list]
+                global_goal.append(0)
+                print(global_goal)
+                break
+            except (ValueError, NameError, AttributeError) as e:
+                print("{input} is not valid, please follow the format".format(input=user_input))
 
-        # Convert path to waypoints
-        waypoints = [[p[0] + north_offset, p[1] + east_offset, TARGET_ALTITUDE, 0] for p in path]
-        # Set self.waypoints
-        self.waypoints = waypoints
-        # TODO: send waypoints to sim (this is just for visualization of waypoints)
+        waypoints = []
+
+        while True:
+            user_input = int(input("\nChoose Method: [1] Grid-A_star-EucHeuristic-Bresenham [2] Medial_Axis-A_start-BFSHeuristic-Bresenham:\n"))
+            if user_input == 1:
+                self.waypoints = self.proj_min_req(data, global_goal, TARGET_ALTITUDE, SAFETY_DISTANCE)
+                break
+            elif user_input == 2:
+                self.waypoints = self.medial_axis_Astar(data, global_goal, TARGET_ALTITUDE, SAFETY_DISTANCE)
+                break
+            else:
+                continue
+
+        if len(self.waypoints) == 0:
+            self.disarming_transition()
+
         self.send_waypoints()
 
     def start(self):
